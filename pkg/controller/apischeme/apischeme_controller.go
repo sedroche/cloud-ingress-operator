@@ -31,6 +31,8 @@ import (
 
 const (
 	reconcileFinalizerDNS = "dns.cloudingress.managed.openshift.io"
+	elbAnnotationKey      = "service.beta.kubernetes.io/aws-load-balancer-connection-idle-timeout"
+	elbAnnotationValue    = "600"
 )
 
 var (
@@ -198,43 +200,37 @@ func (r *ReconcileAPIScheme) Reconcile(request reconcile.Request) (reconcile.Res
 		return reconcile.Result{}, nil
 	}
 
-	// Does the Service exist already?
-	found := &corev1.Service{}
-	err = r.client.Get(context.TODO(), serviceNamespacedName, found)
+	svc := r.newServiceFor(instance)
+	result, err := controllerutil.CreateOrUpdate(context.TODO(), r.client, svc, func() error {
+		svc.Annotations[elbAnnotationKey] = elbAnnotationValue
+
+		if !sliceEquals(svc.Spec.LoadBalancerSourceRanges, instance.Spec.ManagementAPIServerIngress.AllowedCIDRBlocks) {
+			reqLogger.Info(fmt.Sprintf("Mismatch svc %s != %s\n", svc.Spec.LoadBalancerSourceRanges, instance.Spec.ManagementAPIServerIngress.AllowedCIDRBlocks))
+			reqLogger.Info(fmt.Sprintf("Mismatch between %s/service/%s LoadBalancerSourceRanges and AllowedCIDRBlocks. Updating...", svc.GetNamespace(), svc.GetName()))
+		}
+		svc.Spec.LoadBalancerSourceRanges = instance.Spec.ManagementAPIServerIngress.AllowedCIDRBlocks
+
+		return nil
+	})
 	if err != nil {
-		if errors.IsNotFound(err) {
-			// need to create it
-			dep := r.newServiceFor(instance)
-			reqLogger.Info("Service not found. Creating", "service", dep)
-			err = r.client.Create(context.TODO(), dep)
-			if err != nil {
-				reqLogger.Error(err, "Failure to create new Service")
-				return reconcile.Result{}, err
-			}
-			// Reconcile again to get the new Service and give AWS time to create the ELB
-			reqLogger.Info("Service was just created, so let's try to requeue to set it up")
-			return reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}, nil
-		} else if err != nil {
-			reqLogger.Error(err, "Couldn't get the Service")
-			return reconcile.Result{}, err
-		}
+		reqLogger.Error(err, "Couldn't create or update the Service")
+		return reconcile.Result{}, err
 	}
-	// Reconcile the access list in the Service
-	if !sliceEquals(found.Spec.LoadBalancerSourceRanges, instance.Spec.ManagementAPIServerIngress.AllowedCIDRBlocks) {
-		reqLogger.Info(fmt.Sprintf("Mismatch svc %s != %s\n", found.Spec.LoadBalancerSourceRanges, instance.Spec.ManagementAPIServerIngress.AllowedCIDRBlocks))
-		reqLogger.Info(fmt.Sprintf("Mismatch between %s/service/%s LoadBalancerSourceRanges and AllowedCIDRBlocks. Updating...", found.GetNamespace(), found.GetName()))
-		found.Spec.LoadBalancerSourceRanges = instance.Spec.ManagementAPIServerIngress.AllowedCIDRBlocks
-		err = r.client.Update(context.TODO(), found)
-		if err != nil {
-			reqLogger.Error(err, fmt.Sprintf("Failed to update the %s/service/%s LoadBalancerSourceRanges", found.GetNamespace(), found.GetName()))
-			return reconcile.Result{}, err
-		}
+
+	if result == controllerutil.OperationResultCreated {
+		// Reconcile again to get the new Service and give AWS time to create the ELB
+		reqLogger.Info("Service was just created, so let's try to requeue to set it up", "service", svc)
+		return reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if result == controllerutil.OperationResultUpdated {
+		reqLogger.Info("Service was just updated", "service", svc)
 		// let's re-queue just in case
 		reqLogger.Info("Requeuing after svc update")
 		return reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}, nil
 	}
 
-	err = cloudClient.EnsureAdminAPIDNS(context.TODO(), r.client, instance, found)
+	err = cloudClient.EnsureAdminAPIDNS(context.TODO(), r.client, instance, svc)
 	// Check for error types that this operator knows about
 	switch err {
 	case nil:
@@ -250,7 +246,7 @@ func (r *ReconcileAPIScheme) Reconcile(request reconcile.Request) (reconcile.Res
 		return reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}, nil
 	default:
 		// not one of ours
-		log.Error(err, "Error ensuring Admin API", "instance", instance, "Service", found)
+		log.Error(err, "Error ensuring Admin API", "instance", instance, "Service", svc)
 		return reconcile.Result{}, err
 	}
 }
@@ -264,13 +260,15 @@ func (r *ReconcileAPIScheme) newServiceFor(instance *cloudingressv1alpha1.APISch
 		"apiserver": "true",
 		"app":       "openshift-kube-apiserver",
 	}
+	annotations := map[string]string{}
 	// Note: This owner reference should nbnot be expected to work
 	//ref := metav1.NewControllerRef(instance, instance.GetObjectKind().GroupVersionKind())
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.Spec.ManagementAPIServerIngress.DNSName,
-			Namespace: "openshift-kube-apiserver",
-			Labels:    labels,
+			Name:        instance.Spec.ManagementAPIServerIngress.DNSName,
+			Namespace:   "openshift-kube-apiserver",
+			Labels:      labels,
+			Annotations: annotations,
 			//OwnerReferences: []metav1.OwnerReference{*ref},
 		},
 		Spec: corev1.ServiceSpec{
